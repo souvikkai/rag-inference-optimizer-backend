@@ -1,0 +1,56 @@
+SOUVIK KUNDU
+AI Product Leader | Semiconductor Manufacturing x ML Systems
+(513) 652-6688 | sou.90kd@gmail.com | linkedin.com/in/souvikkundu1 | github.com/souvikkai
+
+SUMMARY
+Semiconductor and AI PM with 9+ years owning hardware NPI and production ML systems inside a fab. Deployed a CNN defect-classification system inline on production wafer images with 99% recall, 4% to 100% lot coverage, eliminated a critical automotive-grade defect, with full MLOps stack including Vertex AI training pipeline, confidence-threshold routing, human-in-the-loop review queue, and biweekly retraining. Deep familiarity with fab KPIs including yield, defect containment, inspection coverage, and process drift. Delivered Intel 18A PDK to NVIDIA and Microsoft. Currently driving $270M in AI data center design wins at ONSEMI collaborating with NVIDIA on 800VDC Blackwell GPU rack architecture.
+
+SKILLS
+Semiconductor and Fab: Defect classification, yield analysis, inspection coverage, process control SPC, AEC-Q101, NPI, PDK delivery to NVIDIA and Microsoft, EDA ecosystem Synopsys Cadence Siemens.
+AI and ML: CNN training and inference, Google Vertex AI production deployment, MLOps, confidence-threshold routing, human-in-the-loop, retraining pipelines, model drift detection, LLM routing and cost modeling.
+Product: 0 to 1 builds, product roadmap, POV and pilot design, ROI quantification, customer discovery, cross-functional leadership, PRD and PRFAQ authoring, OEM partnerships.
+
+EXPERIENCE
+
+Senior Product Manager, Silicon Power Division | ONSEMI Fortune 500 Semiconductor | Scottsdale AZ | February 2025 to Present
+
+AI Defect Classification Production ML System: Led 15-person team to deploy CNN classifier inline on production semiconductor wafer images using Google Vertex AI with 8 GPUs and 5 hour training runs. Achieved 99% recall, scaled inspection coverage from 4% to 100%, drove defect rate from 10% to 0%, eliminated a critical automotive-grade defect escaping to the field. Owned every PM decision including platform selection, goal definition, recall vs precision tradeoff, confidence-threshold design, HITL routing logic, and retraining cadence.
+
+MLOps and Inference Reliability: Designed confidence-threshold routing to human review queue. Biweekly retraining pipeline maintained greater than 90% Average Precision against fab process drift. Reduced design-in time 33% and project budget 20%.
+
+AI Data Center 270M Design Win Portfolio: Leading NPI for SiC power semiconductor dies into AI data center PSU applications. Secured design wins with top-tier AI data center PSU suppliers with combined $270M lifetime revenue. Collaborating with NVIDIA on 800VDC power architecture for next-generation Blackwell GPU racks. Own roadmap, pricing strategy, and P&L across the portfolio.
+
+Hardware NPI and Quality: Qualifying dies to AEC-Q101, negotiating datasheet specs with OEM customers, managing supply allocation under fab constraints.
+
+EV Platform: Secured Volkswagen design win worth $350M platform. Led joint team improving EV range approximately 10%.
+
+Product Manager, Silicon Power Division | ONSEMI | Scottsdale AZ | October 2023 to January 2025
+
+0 to 1 Revenue Build: Launched semiconductor die sales business from 0 to approximately 5% of company revenue. Full unit economics ownership including cost modeling, margin analysis, and pricing strategy. Standardized OEM designs saving $4M per year.
+
+Product Manager, Client Computing Group | Intel Corporation | Chandler AZ | September 2022 to September 2023
+
+Edge SaaS Platform: Led 0 to 1 deployment across cloud-hosted and on-premise configurations. Reduced enterprise deployment time from 24 weeks to 2 weeks. Tiered pricing drove 20% pilot adoption lift and 4 pilots worth approximately $70M lifetime revenue.
+
+Product Manager, Design Enablement Group | Intel Corporation | Chandler AZ | January 2021 to August 2022
+
+Intel 18A PDK to NVIDIA and Microsoft: Delivered Intel's newest process node ASIC PDK to NVIDIA and Microsoft for advanced SoC development. Expanded EDA compatibility with Cadence and Siemens driving 25% adoption increase. Reduced PDK iterations 50%.
+
+Senior Software Engineer, Design Enablement Group | Intel Corporation | Chandler AZ | June 2016 to December 2020
+
+Improved power and performance across process nodes for Intel's leading-edge silicon portfolio. Promoted for outstanding technical impact.
+
+EDUCATION
+
+MBA | UCLA Anderson School of Management | 2023
+MS Electrical Engineering | University of Cincinnati | 2016
+
+AI PROJECTS
+
+Nudge AI Reading Companion | nudge-repo.vercel.app | github.com/souvikkai
+
+Multi-provider LLM routing: Provider-agnostic abstraction layer with Gemini 2.5 Flash and DeepSeek behind unified interface. Selected DeepSeek as production default via empirical benchmarking. DeepSeek is 7x cheaper than Gemini at acceptable quality at approximately $0.0007 vs $0.0052 per call.
+
+Inference observability: Analytics endpoint tracking p50 and p95 latency per tier using PostgreSQL percentile_cont, 14-day call volume, and success rate. Every LLM call instrumented with provider, model, latency in milliseconds, and prompt version.
+
+Stack: FastAPI plus PostgreSQL plus Next.js on Vercel plus Railway. Magic link authentication using Resend and JWT. Automated weekly digest email pipeline.

@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+faiss-cpu
+sentence-transformers
+anthropic
+groq
+cohere
+python-dotenv
+numpy
+python-multipart
+pdfminer.six
+python-docx
+requests
