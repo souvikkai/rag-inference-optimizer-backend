@@ -25,6 +25,7 @@ from sentence_transformers import SentenceTransformer
 import anthropic
 from groq import Groq
 import cohere
+import wandb
 
 load_dotenv()
 
@@ -415,11 +416,14 @@ Score this response on a scale of 0-100 based on:
 Respond with ONLY a JSON object in this exact format:
 {{"score": 85, "faithfulness": 38, "relevance": 25, "specificity": 22, "reasoning": "Brief explanation"}}"""
 
+    
+    judge_start = time.perf_counter()
     response = rag.claude.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=500,
         messages=[{"role": "user", "content": judge_prompt}]
     )
+    judge_latency_ms = (time.perf_counter() - judge_start) * 1000
     
     try:
         raw = response.content[0].text.strip()
@@ -443,11 +447,12 @@ Respond with ONLY a JSON object in this exact format:
             "relevance": relevance,
             "specificity": specificity,
             "reasoning": "See raw output"
+            "judge_latency_ms": round(judge_latency_ms, 1)
         }
     except Exception as e:
         print(f"  Scoring parse error: {e}")
         print(f"  Raw response: {response.content[0].text[:300]}")
-        return {"score": 0, "reasoning": f"Scoring failed: {e}"}
+        return {"score": 0, "reasoning": f"Scoring failed: {e}", "judge_latency_ms": 0}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -501,6 +506,52 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
     groq_savings = round((1 - groq_result["cost_usd"] / claude_cost) * 100, 1) if claude_cost > 0 else 0
     groq_reranked_savings = round((1 - groq_reranked_result["cost_usd"] / claude_cost) * 100, 1) if claude_cost > 0 else 0
     
+# ─────────────────────────────────────────────────────────────
+# W&B LOGGING
+# Log every benchmark run for production observability
+# Non-blocking — W&B failure never breaks the API response
+# ─────────────────────────────────────────────────────────────
+try:
+    wandb.init(
+        project="rag-inference-optimizer",
+        job_type="benchmark",
+        reinit=True
+    )
+
+    for cfg in [
+        ("claude_sonnet", claude_result, claude_score),
+        ("llama_groq", groq_result, groq_score),
+        ("llama_groq_reranker", groq_reranked_result, groq_reranked_score)
+    ]:
+        config_name, result, score = cfg
+        wandb.log({
+            f"{config_name}/retrieve_latency_ms": round(retrieve_latency, 1),
+            f"{config_name}/generation_latency_ms": result["latency_ms"],
+            f"{config_name}/judge_latency_ms": score.get("judge_latency_ms", 0),
+            f"{config_name}/total_latency_ms": round(
+                retrieve_latency + result["latency_ms"] + score.get("judge_latency_ms", 0), 1
+            ),
+            f"{config_name}/generation_cost_usd": result["cost_usd"],
+            f"{config_name}/quality_score": score.get("score", 0),
+            f"{config_name}/faithfulness": score.get("faithfulness", 0),
+            f"{config_name}/relevance": score.get("relevance", 0),
+            f"{config_name}/specificity": score.get("specificity", 0),
+            f"{config_name}/input_tokens": result.get("input_tokens", 0),
+            f"{config_name}/output_tokens": result.get("output_tokens", 0),
+        })
+
+    wandb.log({
+        "retrieval/chunks_retrieved": len(chunks),
+        "retrieval/latency_ms": round(retrieve_latency, 1),
+        "retrieval/top_chunk_score": chunks[0]["score"] if chunks else 0,
+    })
+
+    wandb.finish()
+    print("W&B run logged successfully")
+
+except Exception as e:
+    print(f"W&B logging failed (non-blocking): {e}")
+
     return {
         "retrieved_chunks": chunks,
         "retrieve_latency_ms": round(retrieve_latency, 1),
