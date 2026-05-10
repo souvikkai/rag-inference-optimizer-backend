@@ -446,7 +446,7 @@ Respond with ONLY a JSON object in this exact format:
             "faithfulness": faithfulness,
             "relevance": relevance,
             "specificity": specificity,
-            "reasoning": "See raw output"
+            "reasoning": "See raw output",
             "judge_latency_ms": round(judge_latency_ms, 1)
         }
     except Exception as e:
