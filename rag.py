@@ -506,51 +506,49 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
     groq_savings = round((1 - groq_result["cost_usd"] / claude_cost) * 100, 1) if claude_cost > 0 else 0
     groq_reranked_savings = round((1 - groq_reranked_result["cost_usd"] / claude_cost) * 100, 1) if claude_cost > 0 else 0
     
-# ─────────────────────────────────────────────────────────────
-# W&B LOGGING
-# Log every benchmark run for production observability
-# Non-blocking — W&B failure never breaks the API response
-# ─────────────────────────────────────────────────────────────
-try:
-    wandb.init(
-        project="rag-inference-optimizer",
-        job_type="benchmark",
-        reinit=True
-    )
+    # ─────────────────────────────────────────────────────────────
+    # W&B LOGGING
+    # ─────────────────────────────────────────────────────────────
+    try:
+        wandb.init(
+            project="rag-inference-optimizer",
+            job_type="benchmark",
+            reinit=True
+        )
 
-    for cfg in [
-        ("claude_sonnet", claude_result, claude_score),
-        ("llama_groq", groq_result, groq_score),
-        ("llama_groq_reranker", groq_reranked_result, groq_reranked_score)
-    ]:
-        config_name, result, score = cfg
+        for cfg in [
+            ("claude_sonnet", claude_result, claude_score),
+            ("llama_groq", groq_result, groq_score),
+            ("llama_groq_reranker", groq_reranked_result, groq_reranked_score)
+        ]:
+            config_name, result, score = cfg
+            wandb.log({
+                f"{config_name}/retrieve_latency_ms": round(retrieve_latency, 1),
+                f"{config_name}/generation_latency_ms": result["latency_ms"],
+                f"{config_name}/judge_latency_ms": score.get("judge_latency_ms", 0),
+                f"{config_name}/total_latency_ms": round(
+                    retrieve_latency + result["latency_ms"] + score.get("judge_latency_ms", 0), 1
+                ),
+                f"{config_name}/generation_cost_usd": result["cost_usd"],
+                f"{config_name}/quality_score": score.get("score", 0),
+                f"{config_name}/faithfulness": score.get("faithfulness", 0),
+                f"{config_name}/relevance": score.get("relevance", 0),
+                f"{config_name}/specificity": score.get("specificity", 0),
+                f"{config_name}/input_tokens": result.get("input_tokens", 0),
+                f"{config_name}/output_tokens": result.get("output_tokens", 0),
+            })
+
         wandb.log({
-            f"{config_name}/retrieve_latency_ms": round(retrieve_latency, 1),
-            f"{config_name}/generation_latency_ms": result["latency_ms"],
-            f"{config_name}/judge_latency_ms": score.get("judge_latency_ms", 0),
-            f"{config_name}/total_latency_ms": round(
-                retrieve_latency + result["latency_ms"] + score.get("judge_latency_ms", 0), 1
-            ),
-            f"{config_name}/generation_cost_usd": result["cost_usd"],
-            f"{config_name}/quality_score": score.get("score", 0),
-            f"{config_name}/faithfulness": score.get("faithfulness", 0),
-            f"{config_name}/relevance": score.get("relevance", 0),
-            f"{config_name}/specificity": score.get("specificity", 0),
-            f"{config_name}/input_tokens": result.get("input_tokens", 0),
-            f"{config_name}/output_tokens": result.get("output_tokens", 0),
+            "retrieval/chunks_retrieved": len(chunks),
+            "retrieval/latency_ms": round(retrieve_latency, 1),
+            "retrieval/top_chunk_score": chunks[0]["score"] if chunks else 0,
         })
 
-    wandb.log({
-        "retrieval/chunks_retrieved": len(chunks),
-        "retrieval/latency_ms": round(retrieve_latency, 1),
-        "retrieval/top_chunk_score": chunks[0]["score"] if chunks else 0,
-    })
+        wandb.finish()
+        print("W&B run logged successfully")
 
-    wandb.finish()
-    print("W&B run logged successfully")
-
-except Exception as e:
-    print(f"W&B logging failed (non-blocking): {e}")
+    except Exception as e:
+        print(f"W&B logging failed (non-blocking): {e}")
 
     return {
         "retrieved_chunks": chunks,
