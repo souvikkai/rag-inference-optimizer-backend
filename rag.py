@@ -441,14 +441,19 @@ Respond with ONLY a JSON object in this exact format:
         relevance = int(re.search(r'"relevance":\s*(\d+)', raw).group(1))
         specificity = int(re.search(r'"specificity":\s*(\d+)', raw).group(1))
         
+        import re
+        reasoning_match = re.search(r'"reasoning":\s*"([^"]+)"', raw)
+        reasoning = reasoning_match.group(1) if reasoning_match else "Could not parse"
+
         return {
             "score": score,
             "faithfulness": faithfulness,
             "relevance": relevance,
             "specificity": specificity,
-            "reasoning": "See raw output",
+            "reasoning": reasoning,
             "judge_latency_ms": round(judge_latency_ms, 1)
         }
+    
     except Exception as e:
         print(f"  Scoring parse error: {e}")
         print(f"  Raw response: {response.content[0].text[:300]}")
