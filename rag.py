@@ -8,15 +8,16 @@
 # 3. Stores embeddings in FAISS vector store
 # 4. At query time: embeds JD, retrieves top 5 resume chunks
 # 5. Runs three configurations simultaneously:
-#    - Claude Sonnet (expensive baseline)
+#    - Claude Haiku (generation baseline)
 #    - Llama 3 8B on Groq (cheap, fast)
-#    - Llama 3 8B on Groq + Cohere reranker (cheap, accurate)
-# 6. Scores quality using Claude as LLM-as-judge
+#    - Llama 3 8B on Groq + evidence-aware rerank & diverse context selection
+# 6. Scores quality using Claude Sonnet as LLM-as-judge only
 # ─────────────────────────────────────────────────────────────
 
 import os
 import time
 import json
+import re
 import numpy as np
 import faiss
 from pathlib import Path
@@ -28,6 +29,10 @@ import cohere
 import wandb
 
 load_dotenv()
+
+STANDARD_RETRIEVAL_K = 5
+RERANK_CANDIDATE_K = 25
+FINAL_CONTEXT_K = 5
 
 # ─────────────────────────────────────────────────────────────
 # SECTION 1: CHUNKING
@@ -177,51 +182,54 @@ class ResumeRAG:
         
         return results
     
-    def rerank(self, query: str, chunks: list[dict]) -> list[dict]:
+    def rerank(
+        self,
+        query: str,
+        chunks: list[dict],
+        top_n: int = FINAL_CONTEXT_K,
+    ) -> list[dict]:
         """
-        Use Cohere reranker to reorder chunks by relevance.
+        Use Cohere reranker to score and order chunks for the given query.
         
-        PM explanation: Vector search finds semantically similar
-        chunks. Reranking finds chunks that actually ANSWER the
-        query. These are different -- a chunk can be semantically
-        similar but not useful for answering.
-        
-        Cohere rerank-english-v3.0 is a cross-encoder model that
-        scores each (query, chunk) pair together -- more accurate
-        than embedding similarity alone. Adds ~50ms latency.
+        Returns one dict per Cohere result: rerank_score, faiss_score (original
+        retrieval score), chunk_index, and chunk text.
         """
+        if not chunks:
+            return []
+
         documents = [c["chunk"] for c in chunks]
-        
+        n = min(top_n, len(documents))
+
         response = self.cohere.rerank(
             model="rerank-english-v3.0",
             query=query,
             documents=documents,
-            top_n=5
+            top_n=n,
         )
-        
+
         reranked = []
         for result in response.results:
             original_chunk = chunks[result.index]
             reranked.append({
                 "chunk": original_chunk["chunk"],
-                "score": result.relevance_score,
-                "chunk_index": original_chunk["chunk_index"],
-                "rerank_score": result.relevance_score
+                "faiss_score": float(original_chunk["score"]),
+                "chunk_index": int(original_chunk["chunk_index"]),
+                "rerank_score": float(result.relevance_score),
             })
-        
+
         return reranked
 
 
 # ─────────────────────────────────────────────────────────────
 # SECTION 3: THREE GENERATION CONFIGURATIONS
 #
-# PM explanation: Same retrieved context, three different
-# LLM configurations. This is the benchmark that proves
-# you understand inference cost-quality tradeoffs.
+# PM explanation: Haiku + Groq share standard top-K retrieval; the
+# third config expands candidates, evidence-aware reranks, and picks
+# a diverse final context set before generation.
 #
-# Config 1: Claude Sonnet -- expensive, high quality baseline
+# Config 1: Claude Haiku -- generation baseline
 # Config 2: Llama 3 8B on Groq -- cheap, fast
-# Config 3: Llama 3 8B on Groq + reranker -- cheap + accurate
+# Config 3: Llama 3 8B on Groq + reranker + diversity -- optimized context
 # ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a career coach helping a job applicant 
@@ -253,37 +261,168 @@ JOB DESCRIPTION:
 Generate 5 tailored talking points from the resume context above."""
 
 
-def run_claude(rag: ResumeRAG, chunks: list[dict], jd: str) -> dict:
+def build_evidence_aware_rerank_query(job_description: str) -> str:
     """
-    Config 1: Claude Sonnet
-    Expensive but highest quality. Used as baseline AND as judge.
+    Build a rerank instruction that prefers substantive resume evidence
+    over shallow keyword overlap with the JD.
     """
+    jd_preview = job_description[:1500] + ("..." if len(job_description) > 1500 else "")
+    return f"""You are ranking resume excerpts for an interview-prep assistant.
+
+JOB DESCRIPTION (for relevance only):
+{jd_preview}
+
+Rank these excerpts for USE AS SOURCE MATERIAL for five strong talking points. Prioritize:
+1) Direct relevance to the responsibilities and themes in the job description
+2) Quantified achievements (metrics, scale, %, revenue, latency, etc.)
+3) Concrete resume evidence (specific projects, tools, outcomes), not generic claims
+4) Technical depth where it grounds credible answers
+5) Clear ownership or decision-making (what the candidate led, shipped, or influenced)
+6) Product or business impact tied to outcomes
+
+Also prefer a MIX of angles across five eventual talking points — avoid five chunks that all say the same thing.
+
+Do NOT boost excerpts merely because they repeat many job-description keywords or buzzwords without substantive proof. Favor signal over lexical overlap."""
+
+
+def infer_bucket(text: str) -> str:
+    """Assign a coarse topic bucket for diversity filtering."""
+    low = text.lower()
+
+    if (
+        re.search(r"\b(ai|ml)\b", low)
+        or "machine learning" in low
+        or "model" in low
+        or "vertex" in low
+        or "inference" in low
+        or re.search(r"\brag\b", low)
+        or "llm" in low
+    ):
+        return "ai_ml"
+    if any(
+        k in low
+        for k in (
+            "platform",
+            "infrastructure",
+            "cloud",
+            "gpu",
+            "latency",
+            "throughput",
+            "scaling",
+            "api",
+        )
+    ):
+        return "infra_platform"
+    if any(
+        k in low
+        for k in (
+            "silicon",
+            "semiconductor",
+            "power",
+            "asic",
+            "chip",
+            "eda",
+            "pdk",
+            "nvidia",
+        )
+    ):
+        return "hardware_systems"
+    if any(
+        k in low
+        for k in (
+            "revenue",
+            "cost",
+            "margin",
+            "customer",
+            "design win",
+            "adoption",
+            "growth",
+        )
+    ):
+        return "business_impact"
+    if any(
+        k in low
+        for k in (
+            "led ",
+            "owned ",
+            "drove ",
+            "cross-functional",
+            "cross functional",
+            "stakeholder",
+            "roadmap",
+            "launched",
+        )
+    ) or re.search(r"\bled\b", low) or re.search(r"\bowned\b", low) or re.search(r"\bdrove\b", low):
+        return "leadership_execution"
+
+    return "general"
+
+
+def select_diverse_chunks(reranked_chunks: list[dict], final_k: int = FINAL_CONTEXT_K) -> list[dict]:
+    """
+    Greedy selection: prefer one high-ranking chunk per bucket, then fill
+    remaining slots by rerank order.
+    """
+    if not reranked_chunks:
+        return []
+
+    if len(reranked_chunks) <= final_k:
+        return list(reranked_chunks)
+
+    selected: list[dict] = []
+    seen_index: set[int] = set()
+    seen_buckets: set[str] = set()
+
+    for c in reranked_chunks:
+        if len(selected) >= final_k:
+            break
+        idx = c["chunk_index"]
+        if idx in seen_index:
+            continue
+        b = infer_bucket(c["chunk"])
+        if b not in seen_buckets:
+            selected.append(c)
+            seen_index.add(idx)
+            seen_buckets.add(b)
+
+    for c in reranked_chunks:
+        if len(selected) >= final_k:
+            break
+        idx = c["chunk_index"]
+        if idx in seen_index:
+            continue
+        selected.append(c)
+        seen_index.add(idx)
+
+    return selected[:final_k]
+
+
+def run_haiku(rag: ResumeRAG, chunks: list[dict], jd: str) -> dict:
+    """Config 1: Claude Haiku — generation cost/quality baseline."""
     prompt = build_prompt(chunks, jd)
-    
+
     start = time.perf_counter()
-    
+
     response = rag.claude.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-haiku-4-5",
         max_tokens=800,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
     )
-    
+
     latency_ms = (time.perf_counter() - start) * 1000
-    
-    # Calculate cost
-    # claude-sonnet-4-5: $3/M input tokens, $15/M output tokens
+
     input_tokens = response.usage.input_tokens
     output_tokens = response.usage.output_tokens
-    cost = (input_tokens * 3 / 1_000_000) + (output_tokens * 15 / 1_000_000)
-    
+    cost = (input_tokens * 1 / 1_000_000) + (output_tokens * 5 / 1_000_000)
+
     return {
-        "config": "Claude Sonnet",
+        "config": "Claude Haiku",
         "answer": response.content[0].text,
         "latency_ms": round(latency_ms, 1),
         "cost_usd": round(cost, 6),
         "input_tokens": input_tokens,
-        "output_tokens": output_tokens
+        "output_tokens": output_tokens,
     }
 
 
@@ -323,53 +462,61 @@ def run_groq(rag: ResumeRAG, chunks: list[dict], jd: str) -> dict:
     }
 
 
-def run_groq_reranked(rag: ResumeRAG, base_chunks: list[dict], jd: str) -> dict:
+def run_groq_reranked(rag: ResumeRAG, jd: str) -> dict:
     """
-    Config 3: Llama 3 8B on Groq + Cohere Reranker
-    Reranker improves chunk quality before sending to Llama.
-    Small cost addition (~$0.001) for meaningful quality gain.
+    Config 3: Llama 3 8B on Groq + evidence-aware rerank + diverse context.
+    Retrieves a wide candidate pool, reranks with an evidence-focused query,
+    selects diverse chunks, then generates.
     """
-    # Rerank the retrieved chunks
+    candidate_retrieve_start = time.perf_counter()
+    candidates = rag.retrieve(jd, k=RERANK_CANDIDATE_K)
+    candidate_retrieve_latency = (time.perf_counter() - candidate_retrieve_start) * 1000
+
+    rerank_query = build_evidence_aware_rerank_query(jd)
     rerank_start = time.perf_counter()
-    reranked_chunks = rag.rerank(jd, base_chunks)
+    reranked = rag.rerank(rerank_query, candidates, top_n=RERANK_CANDIDATE_K)
     rerank_latency = (time.perf_counter() - rerank_start) * 1000
     
-    prompt = build_prompt(reranked_chunks, jd)
-    
+    selected = select_diverse_chunks(reranked, final_k=FINAL_CONTEXT_K)
+    selected_chunk_buckets = [infer_bucket(c["chunk"]) for c in selected]
+
+    prompt = build_prompt(selected, jd)
+
     start = time.perf_counter()
-    
+
     response = rag.groq.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ],
         max_tokens=800,
-        temperature=0.1
+        temperature=0.1,
     )
-    
+
     llm_latency = (time.perf_counter() - start) * 1000
-    total_latency = rerank_latency + llm_latency
-    
+    total_latency = candidate_retrieve_latency + rerank_latency + llm_latency
+
     input_tokens = response.usage.prompt_tokens
     output_tokens = response.usage.completion_tokens
-    
-    # Cost: Groq LLM + Cohere rerank
-    # Cohere rerank: $0.001 per 1000 docs (essentially free at this scale)
+
     llm_cost = (input_tokens * 0.05 / 1_000_000) + (output_tokens * 0.08 / 1_000_000)
-    rerank_cost = 0.001 / 1000  # ~$0.000001 per rerank call
+    rerank_cost = 0.001 / 1000
     total_cost = llm_cost + rerank_cost
-    
+
     return {
         "config": "Llama 3 8B + Reranker (Groq)",
         "answer": response.choices[0].message.content,
         "latency_ms": round(total_latency, 1),
+        "candidate_retrieve_latency_ms": round(candidate_retrieve_latency, 1),
         "rerank_latency_ms": round(rerank_latency, 1),
         "llm_latency_ms": round(llm_latency, 1),
         "cost_usd": round(total_cost, 6),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "reranked_chunks": reranked_chunks
+        "selected_chunks": selected,
+        "candidate_chunks_count": len(candidates),
+        "selected_chunk_buckets": selected_chunk_buckets,
     }
 
 
@@ -435,13 +582,11 @@ Respond with ONLY a JSON object in this exact format:
         
         # Extract just the numeric fields we need
         # More robust than full JSON parse
-        import re
         score = int(re.search(r'"score":\s*(\d+)', raw).group(1))
         faithfulness = int(re.search(r'"faithfulness":\s*(\d+)', raw).group(1))
         relevance = int(re.search(r'"relevance":\s*(\d+)', raw).group(1))
         specificity = int(re.search(r'"specificity":\s*(\d+)', raw).group(1))
-        
-        import re
+
         reasoning_match = re.search(r'"reasoning":\s*"([^"]+)"', raw)
         reasoning = reasoning_match.group(1) if reasoning_match else "Could not parse"
 
@@ -451,23 +596,29 @@ Respond with ONLY a JSON object in this exact format:
             "relevance": relevance,
             "specificity": specificity,
             "reasoning": reasoning,
-            "judge_latency_ms": round(judge_latency_ms, 1)
+            "judge_latency_ms": round(judge_latency_ms, 1),
+            "judge_model": "claude-sonnet-4-5",
         }
-    
+
     except Exception as e:
         print(f"  Scoring parse error: {e}")
         print(f"  Raw response: {response.content[0].text[:300]}")
-        return {"score": 0, "reasoning": f"Scoring failed: {e}", "judge_latency_ms": 0}
+        return {
+            "score": 0,
+            "reasoning": f"Scoring failed: {e}",
+            "judge_latency_ms": 0,
+            "judge_model": "claude-sonnet-4-5",
+        }
 
 
 # ─────────────────────────────────────────────────────────────
 # SECTION 5: MAIN BENCHMARK FUNCTION
 #
 # Orchestrates the full pipeline:
-# 1. Retrieve top 5 chunks from resume
-# 2. Run all three configs in sequence
-# 3. Score each config with LLM-as-judge
-# 4. Return comparison results
+# 1. Retrieve top STANDARD_RETRIEVAL_K chunks for Haiku and Groq
+# 2. Run Haiku, Groq, and Groq + rerank/diversity (wide retrieve inside)
+# 3. Score each config with Sonnet as LLM-as-judge
+# 4. Return comparison results (cost vs Haiku baseline)
 # ─────────────────────────────────────────────────────────────
 
 def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
@@ -476,55 +627,76 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
     Returns structured results for the frontend to display.
     """
     print(f"\nRunning benchmark for JD ({len(job_description)} chars)...")
-    
-    # Step 1: Retrieve top 5 resume chunks
-    print("Retrieving relevant resume chunks...")
+
+    print("Retrieving relevant resume chunks (standard retrieval)...")
     retrieve_start = time.perf_counter()
-    chunks = rag.retrieve(job_description, k=5)
+    chunks = rag.retrieve(job_description, k=STANDARD_RETRIEVAL_K)
     retrieve_latency = (time.perf_counter() - retrieve_start) * 1000
-    
+
     print(f"Retrieved {len(chunks)} chunks in {retrieve_latency:.1f}ms")
     for i, c in enumerate(chunks):
         print(f"  Chunk {i+1} (score: {c['score']:.3f}): {c['chunk'][:60]}...")
-    
-    # Step 2: Run three configs
-    print("\nRunning Config 1: Claude Sonnet...")
-    claude_result = run_claude(rag, chunks, job_description)
-    print(f"  Done: {claude_result['latency_ms']}ms, ${claude_result['cost_usd']:.6f}")
-    
+
+    print("\nRunning Config 1: Claude Haiku...")
+    haiku_result = run_haiku(rag, chunks, job_description)
+    print(f"  Done: {haiku_result['latency_ms']}ms, ${haiku_result['cost_usd']:.6f}")
+
     print("Running Config 2: Llama 3 8B on Groq...")
     groq_result = run_groq(rag, chunks, job_description)
     print(f"  Done: {groq_result['latency_ms']}ms, ${groq_result['cost_usd']:.6f}")
-    
-    print("Running Config 3: Llama 3 8B + Reranker...")
-    groq_reranked_result = run_groq_reranked(rag, chunks, job_description)
+
+    print("Running Config 3: Llama 3 8B + evidence-aware rerank + diversity...")
+    groq_reranked_result = run_groq_reranked(rag, job_description)
     print(f"  Done: {groq_reranked_result['latency_ms']}ms, ${groq_reranked_result['cost_usd']:.6f}")
-    
-    # Step 3: Score quality with LLM-as-judge
-    print("\nScoring quality with LLM-as-judge...")
-    claude_score = score_quality(rag, claude_result["answer"], chunks, job_description)
+
+    print("\nScoring quality with LLM-as-judge (Claude Sonnet)...")
+    haiku_score = score_quality(rag, haiku_result["answer"], chunks, job_description)
     groq_score = score_quality(rag, groq_result["answer"], chunks, job_description)
-    groq_reranked_score = score_quality(rag, groq_reranked_result["answer"], chunks, job_description)
-    
-    # Step 4: Calculate cost savings vs Claude baseline
-    claude_cost = claude_result["cost_usd"]
-    groq_savings = round((1 - groq_result["cost_usd"] / claude_cost) * 100, 1) if claude_cost > 0 else 0
-    groq_reranked_savings = round((1 - groq_reranked_result["cost_usd"] / claude_cost) * 100, 1) if claude_cost > 0 else 0
-    
-    # ─────────────────────────────────────────────────────────────
-    # W&B LOGGING
-    # ─────────────────────────────────────────────────────────────
+    rerank_chunks_for_judge = groq_reranked_result["selected_chunks"]
+    groq_reranked_score = score_quality(
+        rag, groq_reranked_result["answer"], rerank_chunks_for_judge, job_description
+    )
+
+    baseline_cost = haiku_result["cost_usd"]
+    groq_savings = (
+        round((1 - groq_result["cost_usd"] / baseline_cost) * 100, 1)
+        if baseline_cost > 0
+        else 0
+    )
+    groq_reranked_savings = (
+        round((1 - groq_reranked_result["cost_usd"] / baseline_cost) * 100, 1)
+        if baseline_cost > 0
+        else 0
+    )
+
     try:
         wandb.init(
             project="rag-inference-optimizer",
             job_type="benchmark",
-            reinit=True
+            reinit=True,
         )
 
+        wandb.log({
+            "judge/model": "claude-sonnet-4-5",
+            "retrieval/standard_k": STANDARD_RETRIEVAL_K,
+            "retrieval/reranker_candidate_k": RERANK_CANDIDATE_K,
+            "retrieval/latency_ms": round(retrieve_latency, 1),
+            "retrieval/chunks_retrieved": len(chunks),
+            "retrieval/top_chunk_score": chunks[0]["score"] if chunks else 0,
+            "llama_groq_reranker/used_reranker": True,
+            "llama_groq_reranker/selected_chunk_buckets": groq_reranked_result[
+                "selected_chunk_buckets"
+            ],
+            "llama_groq_reranker/candidate_chunks_count": groq_reranked_result[
+                "candidate_chunks_count"
+            ],
+            "llama_groq_reranker/final_context_k": FINAL_CONTEXT_K,
+        })
+
         for cfg in [
-            ("claude_sonnet", claude_result, claude_score),
+            ("claude_haiku", haiku_result, haiku_score),
             ("llama_groq", groq_result, groq_score),
-            ("llama_groq_reranker", groq_reranked_result, groq_reranked_score)
+            ("llama_groq_reranker", groq_reranked_result, groq_reranked_score),
         ]:
             config_name, result, score = cfg
             wandb.log({
@@ -532,7 +704,10 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
                 f"{config_name}/generation_latency_ms": result["latency_ms"],
                 f"{config_name}/judge_latency_ms": score.get("judge_latency_ms", 0),
                 f"{config_name}/total_latency_ms": round(
-                    retrieve_latency + result["latency_ms"] + score.get("judge_latency_ms", 0), 1
+                    retrieve_latency
+                    + result["latency_ms"]
+                    + score.get("judge_latency_ms", 0),
+                    1,
                 ),
                 f"{config_name}/generation_cost_usd": result["cost_usd"],
                 f"{config_name}/quality_score": score.get("score", 0),
@@ -542,12 +717,6 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
                 f"{config_name}/input_tokens": result.get("input_tokens", 0),
                 f"{config_name}/output_tokens": result.get("output_tokens", 0),
             })
-
-        wandb.log({
-            "retrieval/chunks_retrieved": len(chunks),
-            "retrieval/latency_ms": round(retrieve_latency, 1),
-            "retrieval/top_chunk_score": chunks[0]["score"] if chunks else 0,
-        })
 
         wandb.finish()
         print("W&B run logged successfully")
@@ -560,24 +729,24 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
         "retrieve_latency_ms": round(retrieve_latency, 1),
         "configs": [
             {
-                **claude_result,
-                "quality_score": claude_score.get("score", 0),
-                "quality_breakdown": claude_score,
-                "cost_savings_vs_baseline": "baseline"
+                **haiku_result,
+                "quality_score": haiku_score.get("score", 0),
+                "quality_breakdown": haiku_score,
+                "cost_savings_vs_baseline": "baseline",
             },
             {
                 **groq_result,
                 "quality_score": groq_score.get("score", 0),
                 "quality_breakdown": groq_score,
-                "cost_savings_vs_baseline": f"{groq_savings}% cheaper"
+                "cost_savings_vs_baseline": f"{groq_savings}% cheaper",
             },
             {
                 **groq_reranked_result,
                 "quality_score": groq_reranked_score.get("score", 0),
                 "quality_breakdown": groq_reranked_score,
-                "cost_savings_vs_baseline": f"{groq_reranked_savings}% cheaper"
-            }
-        ]
+                "cost_savings_vs_baseline": f"{groq_reranked_savings}% cheaper",
+            },
+        ],
     }
 
 
