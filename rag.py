@@ -18,6 +18,8 @@ import os
 import time
 import json
 import re
+import unicodedata
+from typing import Literal
 import numpy as np
 import faiss
 from pathlib import Path
@@ -29,6 +31,193 @@ import cohere
 import wandb
 
 load_dotenv()
+
+# ─────────────────────────────────────────────────────────────
+# INPUT CLEANING (JD + resume before retrieval / chunking)
+# ─────────────────────────────────────────────────────────────
+
+_URL_RE = re.compile(
+    r"https?://[^\s<>\[\](){}\"']+|www\.[^\s<>\[\](){}\"']+",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+_JD_HEADER_KEYS = frozenset(
+    {
+        "responsibilities",
+        "requirements",
+        "qualifications",
+        "skills",
+        "nice to have",
+        "what you'll do",
+        "about the role",
+    }
+)
+# Longest-first so multi-word headers match before single-word suffixes.
+_JD_HEADER_ORDERED = (
+    "nice to have",
+    "what you'll do",
+    "about the role",
+    "responsibilities",
+    "requirements",
+    "qualifications",
+    "skills",
+)
+
+
+def _normalize_apostrophe(s: str) -> str:
+    return (
+        s.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("`", "'")
+        .strip()
+    )
+
+
+def _strip_urls_emails(text: str) -> str:
+    s = _URL_RE.sub(" ", text)
+    s = _EMAIL_RE.sub(" ", s)
+    return s
+
+
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _remove_repeated_symbols(text: str) -> str:
+    """Collapse PDF-ish noise: repeated bullets, underscores, dashes, etc."""
+    s = re.sub(r"([*•·\-_=□■])\1{2,}", " ", text)
+    s = re.sub(r"([^\w\s])\1{2,}", " ", s)
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+    return s
+
+
+def _jd_header_key_from_line(line: str) -> str | None:
+    s = line.strip()
+    s = re.sub(r"^#+\s*", "", s)
+    s = re.sub(r"\s*:?\s*$", "", s)
+    key = _normalize_apostrophe(s).lower()
+    if key in _JD_HEADER_KEYS:
+        return key
+    for h in _JD_HEADER_ORDERED:
+        if key == h or key.endswith(" " + h):
+            return h
+    return None
+
+
+def _jd_foreign_section_heading(line: str) -> bool:
+    """Non-target section title (e.g. About Us:) — stop capturing until the next known header."""
+    if _jd_header_key_from_line(line) is not None:
+        return False
+    s = line.strip()
+    if not s:
+        return False
+    if re.match(r"^[\-\*•]\s", s):
+        return False
+    if re.match(r"^#+\s*\S", s):
+        return True
+    if len(s) <= 90 and s.endswith(":") and len(s.split()) <= 10:
+        return True
+    return False
+
+
+def _jd_keep_named_sections(text: str) -> str:
+    """
+    If known section headers appear as lines, keep only those sections.
+    Otherwise return text unchanged (caller already normalized newlines).
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    blocks: list[str] = []
+    current: list[str] = []
+    active = False
+    saw_header = False
+
+    for line in lines:
+        hdr = _jd_header_key_from_line(line)
+        if hdr is not None:
+            saw_header = True
+            if active and current:
+                blocks.append("\n".join(current).strip())
+            current = []
+            active = True
+        elif active:
+            if _jd_foreign_section_heading(line):
+                if current:
+                    blocks.append("\n".join(current).strip())
+                current = []
+                active = False
+            else:
+                current.append(line)
+
+    if active and current:
+        blocks.append("\n".join(current).strip())
+
+    if not saw_header:
+        return text
+
+    merged = "\n\n".join(b for b in blocks if b.strip())
+    return merged if merged.strip() else text
+
+
+def _clean_job_description(text: str) -> str:
+    s = _strip_urls_emails(text)
+    s = _remove_repeated_symbols(s)
+    s = _jd_keep_named_sections(s)
+    s = _collapse_whitespace(s)
+    if len(s) > 5000:
+        s = s[:5000]
+    return s
+
+
+_RESUME_CONTACT_LINE = re.compile(
+    r"(?i)\b(?:linkedin\.com|twitter\.com|x\.com|medium\.com|calendly)\b"
+)
+
+
+def _resume_keep_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if _RESUME_CONTACT_LINE.search(s):
+        return False
+    if re.match(
+        r"(?i)^[\s\-•]{0,4}(repository|repo|demo|live\s+demo|source\s+code|staging\s+url|production\s+url)\s*:",
+        s,
+    ):
+        return False
+    if re.match(r"(?i)^\s*(?:https?://|www\.)", s):
+        return False
+    if re.match(r"(?i)^\s*(github\.com|gitlab\.com|bitbucket\.org)/[\w./-]+\s*$", s):
+        return False
+    if re.match(r"^[\d\s\-+()./]{10,}$", s):
+        return False
+    if re.search(r"(?i)^(phone|tel|mobile|e-?mail)\s*:", s):
+        return False
+    if "www." in s.lower():
+        return False
+    return True
+
+
+def _clean_resume_text(text: str) -> str:
+    s = unicodedata.normalize("NFKC", text)
+    s = _strip_urls_emails(s)
+    s = _remove_repeated_symbols(s)
+    lines = s.replace("\r\n", "\n").split("\n")
+    kept = [ln for ln in lines if _resume_keep_line(ln)]
+    s = "\n".join(kept)
+    s = _collapse_whitespace(s)
+    return s
+
+
+def clean_input_text(text: str, kind: Literal["job_description", "resume"]) -> str:
+    """Normalize JD or resume text before retrieval / chunking."""
+    if kind == "job_description":
+        return _clean_job_description(text)
+    if kind == "resume":
+        return _clean_resume_text(text)
+    raise ValueError(f"Unknown kind: {kind!r}")
+
 
 STANDARD_RETRIEVAL_K = 5
 RERANK_CANDIDATE_K = 25
@@ -554,6 +743,16 @@ JOB DESCRIPTION:
 AI-GENERATED TALKING POINTS:
 {answer}
 
+NON-ANSWER RULE (apply BEFORE the scoring rubric below):
+If the AI-generated talking points ask the user to provide a job description, say the JD is missing, refuse to generate talking points, or provide a checklist instead of actual candidate-specific talking points, assign:
+score: 0
+faithfulness: 0
+relevance: 0
+specificity: 0
+
+VALID ANSWER REQUIREMENT:
+A valid response must consist of exactly five candidate-specific talking points grounded in the resume context above—each point must tie to concrete resume evidence, not generic advice or hypothetical tips. If there are fewer than five substantive points, or points are not grounded in the resume context, assign very low scores across faithfulness, relevance, and specificity.
+
 Score this response on a scale of 0-100 based on:
 1. Faithfulness (0-40 points): Are all claims grounded in the resume context? 
    Deduct points for any invented or unsupported claims.
@@ -621,11 +820,34 @@ Respond with ONLY a JSON object in this exact format:
 # 4. Return comparison results (cost vs Haiku baseline)
 # ─────────────────────────────────────────────────────────────
 
-def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
-    """
-    Run the full three-config benchmark for a job description.
-    Returns structured results for the frontend to display.
-    """
+def _wandb_try_init() -> bool:
+    try:
+        wandb.init(
+            project="rag-inference-optimizer",
+            job_type="benchmark",
+            reinit=True,
+        )
+        return True
+    except Exception as e:
+        print(f"W&B init failed (non-blocking): {e}")
+        return False
+
+
+def _wandb_safe_log(payload: dict, active: bool) -> None:
+    if not active:
+        return
+    try:
+        wandb.log(payload)
+    except Exception as e:
+        print(f"W&B log failed (non-blocking): {e}")
+
+
+def _run_benchmark_impl(
+    rag: ResumeRAG,
+    job_description: str,
+    wandb_active: bool,
+    original_job_description: str | None,
+) -> dict:
     print(f"\nRunning benchmark for JD ({len(job_description)} chars)...")
 
     print("Retrieving relevant resume chunks (standard retrieval)...")
@@ -637,17 +859,65 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
     for i, c in enumerate(chunks):
         print(f"  Chunk {i+1} (score: {c['score']:.3f}): {c['chunk'][:60]}...")
 
+    jd_first_1000 = job_description[:1000]
+    jd_last_1000 = (
+        job_description[-1000:] if len(job_description) > 1000 else job_description
+    )
+    top_chunks_preview = [c["chunk"][:200] for c in chunks]
+    top_chunk_scores = [float(c["score"]) for c in chunks]
+
+    preflight: dict = {
+        "jd/cleaned_char_count": len(job_description),
+        "jd/preview_first_1000_chars": jd_first_1000,
+        "jd/preview_last_1000_chars": jd_last_1000,
+        "retrieval/top_chunks_preview": top_chunks_preview,
+        "retrieval/top_chunk_scores": top_chunk_scores,
+    }
+    if original_job_description is not None:
+        preflight["jd/original_char_count"] = len(original_job_description)
+    _wandb_safe_log(preflight, wandb_active)
+
     print("\nRunning Config 1: Claude Haiku...")
+    haiku_prompt = build_prompt(chunks, job_description)
     haiku_result = run_haiku(rag, chunks, job_description)
     print(f"  Done: {haiku_result['latency_ms']}ms, ${haiku_result['cost_usd']:.6f}")
+    _wandb_safe_log(
+        {
+            "claude_haiku/prompt_preview_first_1500_chars": haiku_prompt[:1500],
+            "claude_haiku/answer_preview_first_1000_chars": haiku_result["answer"][:1000],
+            "claude_haiku/input_prompt_preview": haiku_prompt,
+            "claude_haiku/output_text": haiku_result["answer"],
+        },
+        wandb_active,
+    )
 
     print("Running Config 2: Llama 3 8B on Groq...")
+    groq_prompt = build_prompt(chunks, job_description)
     groq_result = run_groq(rag, chunks, job_description)
     print(f"  Done: {groq_result['latency_ms']}ms, ${groq_result['cost_usd']:.6f}")
+    _wandb_safe_log(
+        {
+            "llama_groq/prompt_preview_first_1500_chars": groq_prompt[:1500],
+            "llama_groq/answer_preview_first_1000_chars": groq_result["answer"][:1000],
+        },
+        wandb_active,
+    )
 
     print("Running Config 3: Llama 3 8B + evidence-aware rerank + diversity...")
     groq_reranked_result = run_groq_reranked(rag, job_description)
     print(f"  Done: {groq_reranked_result['latency_ms']}ms, ${groq_reranked_result['cost_usd']:.6f}")
+    rerank_gen_prompt = build_prompt(
+        groq_reranked_result["selected_chunks"], job_description
+    )
+    _wandb_safe_log(
+        {
+            "llama_groq_reranker/prompt_preview_first_1500_chars": rerank_gen_prompt[:1500],
+            "llama_groq_reranker/answer_preview_first_1000_chars": groq_reranked_result[
+                "answer"
+            ][:1000],
+        },
+        wandb_active,
+    )
 
     print("\nScoring quality with LLM-as-judge (Claude Sonnet)...")
     haiku_score = score_quality(rag, haiku_result["answer"], chunks, job_description)
@@ -670,28 +940,25 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
     )
 
     try:
-        wandb.init(
-            project="rag-inference-optimizer",
-            job_type="benchmark",
-            reinit=True,
+        _wandb_safe_log(
+            {
+                "judge/model": "claude-sonnet-4-5",
+                "retrieval/standard_k": STANDARD_RETRIEVAL_K,
+                "retrieval/reranker_candidate_k": RERANK_CANDIDATE_K,
+                "retrieval/latency_ms": round(retrieve_latency, 1),
+                "retrieval/chunks_retrieved": len(chunks),
+                "retrieval/top_chunk_score": chunks[0]["score"] if chunks else 0,
+                "llama_groq_reranker/used_reranker": True,
+                "llama_groq_reranker/selected_chunk_buckets": groq_reranked_result[
+                    "selected_chunk_buckets"
+                ],
+                "llama_groq_reranker/candidate_chunks_count": groq_reranked_result[
+                    "candidate_chunks_count"
+                ],
+                "llama_groq_reranker/final_context_k": FINAL_CONTEXT_K,
+            },
+            wandb_active,
         )
-
-        wandb.log({
-            "judge/model": "claude-sonnet-4-5",
-            "retrieval/standard_k": STANDARD_RETRIEVAL_K,
-            "retrieval/reranker_candidate_k": RERANK_CANDIDATE_K,
-            "retrieval/latency_ms": round(retrieve_latency, 1),
-            "retrieval/chunks_retrieved": len(chunks),
-            "retrieval/top_chunk_score": chunks[0]["score"] if chunks else 0,
-            "llama_groq_reranker/used_reranker": True,
-            "llama_groq_reranker/selected_chunk_buckets": groq_reranked_result[
-                "selected_chunk_buckets"
-            ],
-            "llama_groq_reranker/candidate_chunks_count": groq_reranked_result[
-                "candidate_chunks_count"
-            ],
-            "llama_groq_reranker/final_context_k": FINAL_CONTEXT_K,
-        })
 
         for cfg in [
             ("claude_haiku", haiku_result, haiku_score),
@@ -699,30 +966,29 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
             ("llama_groq_reranker", groq_reranked_result, groq_reranked_score),
         ]:
             config_name, result, score = cfg
-            wandb.log({
-                f"{config_name}/retrieve_latency_ms": round(retrieve_latency, 1),
-                f"{config_name}/generation_latency_ms": result["latency_ms"],
-                f"{config_name}/judge_latency_ms": score.get("judge_latency_ms", 0),
-                f"{config_name}/total_latency_ms": round(
-                    retrieve_latency
-                    + result["latency_ms"]
-                    + score.get("judge_latency_ms", 0),
-                    1,
-                ),
-                f"{config_name}/generation_cost_usd": result["cost_usd"],
-                f"{config_name}/quality_score": score.get("score", 0),
-                f"{config_name}/faithfulness": score.get("faithfulness", 0),
-                f"{config_name}/relevance": score.get("relevance", 0),
-                f"{config_name}/specificity": score.get("specificity", 0),
-                f"{config_name}/input_tokens": result.get("input_tokens", 0),
-                f"{config_name}/output_tokens": result.get("output_tokens", 0),
-            })
-
-        wandb.finish()
-        print("W&B run logged successfully")
-
+            _wandb_safe_log(
+                {
+                    f"{config_name}/retrieve_latency_ms": round(retrieve_latency, 1),
+                    f"{config_name}/generation_latency_ms": result["latency_ms"],
+                    f"{config_name}/judge_latency_ms": score.get("judge_latency_ms", 0),
+                    f"{config_name}/total_latency_ms": round(
+                        retrieve_latency
+                        + result["latency_ms"]
+                        + score.get("judge_latency_ms", 0),
+                        1,
+                    ),
+                    f"{config_name}/generation_cost_usd": result["cost_usd"],
+                    f"{config_name}/quality_score": score.get("score", 0),
+                    f"{config_name}/faithfulness": score.get("faithfulness", 0),
+                    f"{config_name}/relevance": score.get("relevance", 0),
+                    f"{config_name}/specificity": score.get("specificity", 0),
+                    f"{config_name}/input_tokens": result.get("input_tokens", 0),
+                    f"{config_name}/output_tokens": result.get("output_tokens", 0),
+                },
+                wandb_active,
+            )
     except Exception as e:
-        print(f"W&B logging failed (non-blocking): {e}")
+        print(f"W&B summary logging failed (non-blocking): {e}")
 
     return {
         "retrieved_chunks": chunks,
@@ -748,6 +1014,31 @@ def run_benchmark(rag: ResumeRAG, job_description: str) -> dict:
             },
         ],
     }
+
+
+def run_benchmark(
+    rag: ResumeRAG,
+    job_description: str,
+    *,
+    original_job_description: str | None = None,
+) -> dict:
+    """
+    Run the full three-config benchmark for a job description.
+    Returns structured results for the frontend to display.
+    """
+    wandb_active = _wandb_try_init()
+    try:
+        return _run_benchmark_impl(
+            rag, job_description, wandb_active, original_job_description
+        )
+    finally:
+        if wandb_active:
+            try:
+                wandb.finish()
+            except Exception as e:
+                print(f"W&B finish failed (non-blocking): {e}")
+            else:
+                print("W&B run logged successfully")
 
 
 # ─────────────────────────────────────────────────────────────

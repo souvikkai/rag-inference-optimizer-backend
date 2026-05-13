@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import os
-from rag import ResumeRAG, run_benchmark
+from rag import ResumeRAG, run_benchmark, clean_input_text
 
 # ─────────────────────────────────────────────────────────────
 # STARTUP -- initialize RAG pipeline once when server starts
@@ -105,17 +105,20 @@ async def benchmark(request: BenchmarkRequest):
     if not rag_instance:
         raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
     
-    if len(request.job_description.strip()) < 50:
+    jd = clean_input_text(request.job_description, kind="job_description")
+
+    if len(jd.strip()) < 50:
         raise HTTPException(
             status_code=400,
             detail="Job description too short. Please paste the full JD."
         )
-    
-    # Truncate very large JDs at the API level
-    jd = request.job_description[:5000]
-    
+
     try:
-        results = run_benchmark(rag_instance, jd)
+        results = run_benchmark(
+            rag_instance,
+            jd,
+            original_job_description=request.job_description,
+        )
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -164,17 +167,13 @@ async def update_resume(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
 
+    text = clean_input_text(text, kind="resume")
+
     if len(text.strip()) < 100:
         raise HTTPException(
             status_code=400,
             detail="Resume too short or could not extract text. Try a .txt file."
         )
-
-    # Clean the text
-    import re
-    text = re.sub(r'[^\x20-\x7E\n\r\t]', ' ', text)
-    text = re.sub(r'\s{4,}', '\n', text)
-    text = text.strip()
 
     # Re-chunk and rebuild FAISS index
     from rag import chunk_resume
