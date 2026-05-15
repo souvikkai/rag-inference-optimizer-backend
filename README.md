@@ -14,7 +14,7 @@ LLM-as-judge → returns comparison results to the frontend.
 
 | Configuration | Model | Purpose |
 |---|---|---|
-| Baseline | Claude Sonnet | Expensive, high quality reference |
+| Baseline | Claude Haiku | Expensive, high quality reference |
 | Fast | Llama 3.1 8B (Groq LPU) | Cheap, sub-second latency |
 | Optimized | Llama 3.1 8B + Cohere Reranker (Groq) | Cheap + reranked retrieval |
 
